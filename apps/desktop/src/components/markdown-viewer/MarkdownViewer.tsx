@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import ReactMarkdown, { type Options as ReactMarkdownOptions } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -102,7 +102,10 @@ function pluginsFor(markdown: string): Plugins {
   return markdown.includes("$") ? MATH_PLUGINS : PLAIN_PLUGINS;
 }
 
-export function MarkdownViewer({
+// Memoized: the parse (react-markdown + KaTeX) dominates a live turn's CPU,
+// and a parent re-render with the same text (a usage/timing update, a sibling
+// row folding) must not re-run it. Only a changed string/variant re-parses.
+export const MarkdownViewer = memo(function MarkdownViewer({
   children,
   className,
   variant = "chat",
@@ -199,7 +202,7 @@ export function MarkdownViewer({
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 /** Inline code that names something openable — a URL, or a path that exists —
  *  becomes a link: underlined on hover, the link menu on click. Anything else

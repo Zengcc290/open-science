@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy, Loader2, Paperclip, Pencil, RotateCcw, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { copyText } from "@/lib/clipboard";
@@ -211,7 +211,10 @@ export const AgentMessage = memo(function AgentMessage({
   // Each mention is resolved to a real workspace path first — prose often names a
   // bare filename ("index.html") whose file lives in a subdirectory; mentions of
   // files that don't exist get no chip.
-  const mentioned = onOpenArtifact ? extractArtifactRefs(shown) : [];
+  const mentioned = useMemo(
+    () => (onOpenArtifact ? extractArtifactRefs(shown) : []),
+    [shown, onOpenArtifact],
+  );
   const [refs, setRefs] = useState<string[]>([]);
   const mentionedKey = mentioned.join("\n");
   useEffect(() => {

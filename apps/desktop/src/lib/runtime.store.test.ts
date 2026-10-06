@@ -3218,6 +3218,77 @@ describe("background pane streams", () => {
     sync(["/ws/a"]);
     expect(mocks.closedDirs).toContain("/ws/a");
   });
+
+  // The point of the running-lock contribution: a turn in a folder no pane
+  // currently shows must keep folding, so focusing elsewhere — or opening
+  // another Screen — no longer freezes the session left behind.
+  it("streams a running session's folder even when no pane shows it", () => {
+    useRuntimeStore.setState({
+      sessions: [
+        { id: "ses_b", title: "B", directory: "/ws/b" },
+        { id: "ses_fg", title: "FG", directory: "/ws/foreground" },
+      ],
+      runningSessions: { ses_b: true, ses_fg: true },
+    } as never);
+    const sync = useRuntimeStore.getState().syncPaneStreams;
+    sync([]);
+    // /ws/b runs in the background → its own stream. /ws/foreground is the
+    // foreground folder, already covered by the foreground client.
+    expect(dirsBuilt()).toEqual(["/ws/b"]);
+  });
+
+  it("opens a stream when a background session re-locks, and retires it on idle", () => {
+    vi.useFakeTimers();
+    try {
+      useRuntimeStore.setState({
+        sessions: [{ id: "ses_c", title: "C", directory: "/ws/c" }],
+      } as never);
+      // A streamed sign of life takes the running lock even though THIS app
+      // never sent the turn: the folder must start streaming at that moment.
+      mocks.fireEvent({ type: "text.updated", sessionId: "ses_c", text: "tok" });
+      expect(dirsBuilt()).toContain("/ws/c");
+
+      // Idle releases the lock; with no pane showing the folder the stream
+      // retires after the grace period.
+      mocks.fireEvent({ type: "session.idle", sessionId: "ses_c" });
+      vi.advanceTimersByTime(60_000);
+      expect(mocks.closedDirs).toContain("/ws/c");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A running lock can exist before the folder is knowable — a reconnect after
+  // a workspace switch, or a lock set while the session list is still empty.
+  // The stream must appear once the list lands, without waiting for the next
+  // turn or the 15 s reconcile poll.
+  it("opens a stream for a lock whose folder arrives with the session list", async () => {
+    useRuntimeStore.setState({ runningSessions: { ses_late: true } } as never);
+    mocks.sessionList = [{ id: "ses_late", title: "Late", directory: "/ws/late" }];
+    await useRuntimeStore.getState().refreshSessions();
+    expect(dirsBuilt()).toContain("/ws/late");
+  });
+
+  // A dropped background stream used to sit in the map as a dead client: the
+  // still-running folder never re-opened, its events (and its idle) were lost,
+  // and the turn fell through to the 15 s reconcile poll. It must be forgotten
+  // and rebuilt immediately.
+  it("rebuilds a background stream that drops after opening", () => {
+    useRuntimeStore.setState({
+      sessions: [{ id: "ses_d", title: "D", directory: "/ws/d" }],
+      runningSessions: { ses_d: true },
+    } as never);
+    const sync = useRuntimeStore.getState().syncPaneStreams;
+    sync([]);
+    const count = () => dirsBuilt().filter((d) => d === "/ws/d").length;
+    expect(count()).toBe(1);
+
+    // The stream had opened (its connect() resolved ready), then the SSE drop
+    // reaches the client as an error status.
+    mocks.fireStatus("error");
+    expect(mocks.closedDirs).toContain("/ws/d");
+    expect(count()).toBe(2);
+  });
 });
 
 describe("manual context compaction", () => {

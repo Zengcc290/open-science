@@ -183,7 +183,16 @@ export const BlockList = memo(function BlockList({
         offset = cursorAfter(turn, at) + turn.answer.length;
         return (
           // `data-turn` is the anchor the turn navigator scrolls to.
-          <div key={at} data-turn={turnIndex} className="flex flex-col gap-4">
+          // `content-visibility: auto` skips layout/paint for turns scrolled
+          // out of view — on a long conversation that is the bulk of the frame
+          // cost as the tail streams. `contain-intrinsic-size` keeps the
+          // scrollbar (and the scroll anchor) stable while a turn is skipped.
+          <div
+            key={at}
+            data-turn={turnIndex}
+            className="flex flex-col gap-4"
+            style={{ contentVisibility: "auto", containIntrinsicSize: "auto 360px" }}
+          >
             {turn.lead.map((b, i) => renderOne(b, at + i))}
             {(() => {
               const done = isTurnDone(turn);

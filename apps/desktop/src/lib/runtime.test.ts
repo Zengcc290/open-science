@@ -4,6 +4,7 @@ import { AUTO_REVIEW_PROMPT } from "./autoReview";
 import { GOAL_RESUME_NUDGE } from "./goalPrompts";
 import {
   datedWorkspaceName,
+  desiredStreamDirs,
   explainRuntimeError,
   turnStillStreaming,
   foldCarriageReturns,
@@ -942,5 +943,21 @@ describe("turnStillStreaming", () => {
     const failed = [{ role: "assistant" as const, parts: [], created: 3_000, error: "boom" }];
     expect(turnStillStreaming(done, RUNTIME_START)).toBe(false);
     expect(turnStillStreaming(failed, RUNTIME_START)).toBe(false);
+  });
+});
+
+describe("desiredStreamDirs", () => {
+  it("keeps every pane folder and every running folder, minus the foreground", () => {
+    expect(
+      desiredStreamDirs("/ws/fg", ["/ws/a", "/ws/fg"], ["/ws/b", null, "/ws/a", "/ws/fg"]),
+    ).toEqual(["/ws/a", "/ws/b"]);
+  });
+
+  it("deduplicates and drops empty entries", () => {
+    expect(desiredStreamDirs(null, [], [undefined, null, "/ws/b", "/ws/b"])).toEqual(["/ws/b"]);
+  });
+
+  it("a running session alone is enough — no pane has to show its folder", () => {
+    expect(desiredStreamDirs("/ws/fg", [], ["/ws/b"])).toEqual(["/ws/b"]);
   });
 });

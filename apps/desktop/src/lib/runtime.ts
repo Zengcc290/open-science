@@ -711,8 +711,11 @@ function removeStreamClient(dir: string) {
   cancelStreamRetirement(dir);
   const c = streamClients.get(dir);
   if (c) {
-    c.close();
+    // Forget it BEFORE closing: a close that synchronously reports "offline"
+    // (the SDK may, and the drop handler forwards error/offline into
+    // removeStreamClient) must not find itself still in the map and recurse.
     streamClients.delete(dir);
+    c.close();
   }
 }
 /**
@@ -746,8 +749,110 @@ function retireStreamClient(dir: string) {
 }
 function teardownStreamClients() {
   for (const dir of [...streamRetirements.keys()]) cancelStreamRetirement(dir);
-  for (const c of streamClients.values()) c.close();
+  // Forget every stream BEFORE closing any: a close that synchronously reports
+  // "offline" is routed into removeStreamClient by the drop handler, and finding
+  // itself still in the map would close it a second time.
+  const clients = [...streamClients.values()];
   streamClients.clear();
+  for (const c of clients) c.close();
+}
+/** The pane folder set the UI last reported (LiveSessionPage's visible panes).
+ *  Kept module-side so a running lock appearing/disappearing can recompute the
+ *  stream topology without the UI having to notify us again. */
+let paneStreamDirs: string[] = [];
+/** Every folder that needs its own stream: the visible panes PLUS the folder of
+ *  every session still holding a running lock, minus the foreground (its client
+ *  already streams that folder for all its sessions). Pure — exported for
+ *  tests. A session left running in a folder no pane currently shows keeps its
+ *  stream, so focusing elsewhere — or switching Screens — no longer freezes it. */
+export function desiredStreamDirs(
+  foreground: string | null,
+  paneDirs: readonly string[],
+  runningDirs: readonly (string | null | undefined)[],
+): string[] {
+  const wanted = new Set<string>();
+  for (const d of [...paneDirs, ...runningDirs]) {
+    if (d && d !== foreground) wanted.add(d);
+  }
+  return [...wanted];
+}
+/** The folder a running lock belongs to, following the parent chain for a
+ *  subagent session (children are not always in the listed `sessions`). */
+function dirOfRunningSession(
+  sessions: readonly { id: string; directory?: string }[],
+  parents: Record<string, string>,
+  sid: string,
+): string | null {
+  let cur: string | undefined = sid;
+  for (let hops = 0; cur && hops < 8; hops++) {
+    const found = sessions.find((x) => x.id === cur);
+    if (found) return found.directory ?? null;
+    cur = parents[cur];
+  }
+  return null;
+}
+/** Recompute the background-stream set from the visible panes AND every running
+ *  session, then open/close streams to match. Called when the pane set changes
+ *  (UI) and whenever a running lock is taken or dropped — turn start,
+ *  session.idle, session error, interrupt, reconcile, history load — so a
+ *  background turn keeps folding even while its pane is not on screen. */
+function applyStreamTopology(): void {
+  if (isGatewayWeb || !opencodeClient) return;
+  const s = useRuntimeStore.getState();
+  const foreground = s.workspace;
+  const wanted = new Set(
+    desiredStreamDirs(
+      foreground,
+      paneStreamDirs,
+      Object.keys(s.runningSessions).map((sid) =>
+        dirOfRunningSession(s.sessions, s.sessionParents, sid),
+      ),
+    ),
+  );
+  for (const dir of [...streamClients.keys()]) {
+    // The FOREGROUND folder's stream still closes at once — the foreground
+    // client covers it, and two live streams would fold every event twice.
+    // Anything else only leaves the tiled set, which a screen switch does to
+    // a whole screen's worth of folders at a time; give those a grace period.
+    if (!wanted.has(dir)) {
+      if (dir === foreground) removeStreamClient(dir);
+      else retireStreamClient(dir);
+    }
+  }
+  for (const dir of wanted) {
+    // Back before its retirement fired: keep the stream, cancel the timer.
+    cancelStreamRetirement(dir);
+    if (streamClients.has(dir)) continue;
+    const c = new OpenCodeClient({
+      baseUrl: streamBaseUrl,
+      directory: dir,
+      password: streamPassword,
+    });
+    if (sharedEventHandler) c.onEvent(sharedEventHandler);
+    streamClients.set(dir, c);
+    // A dropped background stream must not sit in the map as a dead client:
+    // the topology pass treats "has a stream" as live, so a stream that died
+    // (sidecar blip, SSE error) froze its folder — and its missed idle fell
+    // through to the 15 s reconcile poll — until some later lock change
+    // happened to rebuild it. A stream that HAD opened is forgotten and
+    // recomputed at once (a folder still wanted reopens here). One that never
+    // opened is just forgotten: retrying from its own failure would spin while
+    // the sidecar is down, and the next natural trigger tries again anyway.
+    let opened = false;
+    c.onStatus((status) => {
+      if (status === "ready") {
+        opened = true;
+        return;
+      }
+      if (status !== "error" && status !== "offline") return;
+      if (streamClients.get(dir) !== c) return;
+      removeStreamClient(dir);
+      if (opened) applyStreamTopology();
+    });
+    // Best-effort: a background stream that can't open just leaves that pane
+    // non-live until it's focused (foreground reconnect covers it).
+    void c.connect().catch(() => {});
+  }
 }
 /** The connected client whose stream owns `sid` — its folder's background
  *  stream, else the foreground client. Session-scoped calls (send/abort/history)
@@ -1741,6 +1846,9 @@ async function performTurn(
         runningSessions: { ...s.runningSessions, [sid]: true },
         ...(shell ? { shellTurns: { ...s.shellTurns, [sid]: true as const } } : {}),
       }));
+      // A running lock just appeared: its folder needs a stream of its own
+      // while the turn runs (applyStreamTopology filters the foreground).
+      applyStreamTopology();
       const mark = sseSeq;
       try {
         await post(sid);
@@ -1785,6 +1893,8 @@ async function performTurn(
       void logDebug(`send POST ok ${sid} ${Math.round(performance.now() - t0)}ms`);
       turnPostAt.set(sid, performance.now());
       set((s) => ({ runningSessions: { ...s.runningSessions, [sid]: true } }));
+      // Same as the sync path: the turn's folder must stream while it runs.
+      applyStreamTopology();
     }
     void logDebug("turn OK");
     return sid;
@@ -3070,6 +3180,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
           !get().runningSessions[active]
         ) {
           set((s) => ({ runningSessions: { ...s.runningSessions, [active]: true } }));
+          // A streamed sign of life re-locked a session: make sure its folder
+          // has a live stream even if no pane is showing it (#34).
+          applyStreamTopology();
         }
       }
       if (event.type === "error") {
@@ -3089,6 +3202,7 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
             delete retryNotices[sid];
             return { runningSessions, retryNotices };
           });
+          applyStreamTopology();
           return;
         }
         if (sid && interruptedSessions.has(sid)) return;
@@ -3134,6 +3248,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               },
             };
           });
+          // The turn is over (this path unlocks instead of session.idle):
+          // recompute which folders still need a stream.
+          applyStreamTopology();
           // This one failure the user cannot act on without help: the bad
           // message is indistinguishable by eye, and every retry resends it.
           if (MALFORMED_HISTORY.test(event.message)) {
@@ -3417,6 +3534,10 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
       // After the fold, which is what clears this session's running lock — the
       // review claims it again for its own turn.
       if (event.type === "session.idle") onTurnIdle(set, get, sid, true);
+      // The lock may have just cleared: a folder kept streaming only because of
+      // it can now retire. Runs after onTurnIdle so a review that re-locked the
+      // session for its own turn keeps its stream.
+      if (event.type === "session.idle") applyStreamTopology();
       const presentationEventKey =
         event.type === "tool.updated" ? `${sid}:${event.callId}` : null;
       if (
@@ -3805,6 +3926,11 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
         for (const m of sessions) if (m.parentId) sessionParents[m.id] = m.parentId;
         return { sessions, sessionParents };
       });
+      // The list is what turns a running lock into a folder. A lock taken
+      // before its session was listed (a workspace switch's reconnect, a
+      // freshly created session) resolved to no directory at the time, so the
+      // topology has to be recomputed once the folder is knowable.
+      applyStreamTopology();
     } catch {
       /* ignore transient list failures */
     }
@@ -4145,6 +4271,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
           ? { runningSessions: { ...s.runningSessions, [id]: true as const } }
           : {}),
       }));
+      // History says the turn is still running: its folder needs a stream now,
+      // even if the pane that opened it is not the foreground one.
+      applyStreamTopology();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (seq !== openSessionSeq || get().currentId !== id) return;
@@ -4206,6 +4335,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
           ? { runningSessions: { ...s.runningSessions, [id]: true as const } }
           : {}),
       }));
+      // Same as openSession: a background pane's own history can carry a live
+      // lock — keep its folder streaming.
+      applyStreamTopology();
     } catch {
       /* best-effort: a never-loaded pane keeps its skeleton; a thread that had
        * already failed keeps its retryable error line. Either way a later
@@ -4408,6 +4540,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
         },
       };
     });
+    // The stopped turn released its folder's lock (and its subagents'): drop
+    // streams that only existed for it.
+    applyStreamTopology();
   },
 
   editMessage: async (messageID, newText, sessionId) => {
@@ -4445,6 +4580,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
             sessionAgents: { ...s.sessionAgents, [sid]: lastAgentMode(messages) },
           };
         });
+        // The lock was stale and is now gone: that folder may no longer need a
+        // stream of its own.
+        applyStreamTopology();
       } catch {
         /* best-effort — the next reconnect or poll tries again */
       }
@@ -4484,6 +4622,8 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
         currentId: s.currentId === id ? null : s.currentId,
       };
     });
+    // The deleted session's running lock is gone with it — recompute streams.
+    applyStreamTopology();
   },
 
   renameSession: async (id, title) => {
@@ -4518,6 +4658,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
     set((s) => ({
       sessions: s.sessions.map((x) => (x.id === id ? { ...x, directory } : x)),
     }));
+    // A running session just changed folders: its old folder may no longer need
+    // a stream and the new one may.
+    applyStreamTopology();
     // The move also re-parents the session's own children; re-list so their
     // grouping follows instead of pointing at the old folder.
     void get().refreshSessions();
@@ -4629,37 +4772,12 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   },
 
   syncPaneStreams: (directories) => {
-    // The foreground `client` already streams the active folder; web is
-    // single-pane. Open one background stream per OTHER folder shown, and close
-    // streams for folders no longer tiled.
-    if (isGatewayWeb || !opencodeClient) return;
-    const foreground = get().workspace;
-    const wanted = new Set(directories.filter((d): d is string => !!d && d !== foreground));
-    for (const dir of [...streamClients.keys()]) {
-      // The FOREGROUND folder's stream still closes at once — the foreground
-      // client covers it, and two live streams would fold every event twice.
-      // Anything else only leaves the tiled set, which a screen switch does to
-      // a whole screen's worth of folders at a time; give those a grace period.
-      if (!wanted.has(dir)) {
-        if (dir === foreground) removeStreamClient(dir);
-        else retireStreamClient(dir);
-      }
-    }
-    for (const dir of wanted) {
-      // Back before its retirement fired: keep the stream, cancel the timer.
-      cancelStreamRetirement(dir);
-      if (streamClients.has(dir)) continue;
-      const c = new OpenCodeClient({
-        baseUrl: streamBaseUrl,
-        directory: dir,
-        password: streamPassword,
-      });
-      if (sharedEventHandler) c.onEvent(sharedEventHandler);
-      streamClients.set(dir, c);
-      // Best-effort: a background stream that can't open just leaves that pane
-      // non-live until it's focused (foreground reconnect covers it).
-      void c.connect().catch(() => {});
-    }
+    // The panes report which folders they show; the running locks contribute
+    // theirs module-side (see applyStreamTopology), so a background turn keeps
+    // streaming even when no pane currently shows its folder. Web is
+    // single-pane and has no background streams.
+    paneStreamDirs = directories;
+    applyStreamTopology();
   },
 }));
 
